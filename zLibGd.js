@@ -6,11 +6,13 @@ class ZLibGdPlugin {
     constructor() {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
-        this.site = 'https://z-lib.gd';
-        this.version = '0.2.2';
+        this.site = 'https://z-lib.do';
+        this.version = '0.2.3';
         this.icon = 'src/en/zLibGd/icon.png';
-        this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.gd/' } };
-        this.readerOrigin = 'https://reader.z-lib.gd';
+        this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.do/' } };
+        this.readerOrigin = 'https://reader.z-lib.do';
+        this.bookOrigins = ['https://z-lib.gd', 'https://z-lib.do'];
+        this.readerOrigins = ['https://reader.z-lib.gd', 'https://reader.z-lib.do'];
         this.sessions = new Map();
         this.challengeCookies = new Map();
     }
@@ -120,8 +122,8 @@ class ZLibGdPlugin {
     }
     bookPath(input) {
         const url = new URL(this.absoluteUrl(input, this.site));
-        if (url.origin !== this.site || !/^\/book\/[^/]+\/.+\.html$/.test(url.pathname)) {
-            throw new Error('Use a z-lib.gd book details URL.');
+        if (!this.bookOrigins.includes(url.origin) || !/^\/book\/[^/]+\/.+\.html$/.test(url.pathname)) {
+            throw new Error('Use a z-lib.do or z-lib.gd book details URL.');
         }
         return url.pathname;
     }
@@ -134,7 +136,7 @@ class ZLibGdPlugin {
     }
     async text(url, init) {
         const origin = new URL(url).origin;
-        const eligible = origin === this.site || origin === this.readerOrigin;
+        const eligible = this.bookOrigins.includes(origin) || this.readerOrigins.includes(origin);
         const request = () => {
             const cookie = eligible ? this.challengeCookies.get(origin) : undefined;
             return (0, fetch_1.fetchApi)(url, cookie ? { ...init, headers: { ...init?.headers, Cookie: cookie } } : init);
@@ -157,13 +159,14 @@ class ZLibGdPlugin {
         return body;
     }
     async api(path, session, body) {
-        const url = new URL(this.absoluteUrl(path, this.readerOrigin));
+        const readerOrigin = session.readerOrigin || this.readerOrigin;
+        const url = new URL(this.absoluteUrl(path, readerOrigin));
         if (session.accessToken)
             url.searchParams.set('access_token', session.accessToken);
         const headers = {
             Accept: 'application/json',
             'Content-Type': 'application/json',
-            Referer: this.readerOrigin + '/',
+            Referer: readerOrigin + '/',
         };
         if (session.csrf)
             headers['X-CSRF-TOKEN'] = session.csrf;
@@ -200,7 +203,7 @@ class ZLibGdPlugin {
             signedUrl = result[source];
         if (!signedUrl)
             throw new Error('This resource is unavailable for the current reader session.');
-        const target = new URL(this.absoluteUrl(signedUrl, this.readerOrigin));
+        const target = new URL(this.absoluteUrl(signedUrl, session.readerOrigin));
         if (target.protocol !== 'https:')
             throw new Error('Unexpected resource URL.');
         return target.href;
@@ -215,8 +218,8 @@ class ZLibGdPlugin {
         if (!link)
             throw new Error('This book does not expose a Read Online link.');
         const readerUrl = new URL(this.absoluteUrl(link, this.site));
-        if (readerUrl.origin !== this.readerOrigin)
-            throw new Error('Reader domain changed; this plugin needs an update.');
+        if (!this.readerOrigins.includes(readerUrl.origin))
+            throw new Error(`Unsupported reader domain: ${readerUrl.hostname}.`);
         const html = await this.text(readerUrl.href);
         const reader = (0, cheerio_1.load)(html);
         const csrf = reader('meta[name="csrf-token"]').attr('content');
@@ -226,6 +229,7 @@ class ZLibGdPlugin {
         // Decode a JSON string literal; never evaluate page JavaScript.
         const info = JSON.parse(JSON.parse('"' + match[1] + '"'));
         const session = {
+            readerOrigin: readerUrl.origin,
             csrf, accessToken: '', fileToken: '', bookToken: '', fileId: '', opfUrl: '',
             expiresAt: Date.now() + 5 * 60 * 1000, toc: [],
         };
@@ -353,7 +357,8 @@ class ZLibGdPlugin {
         const path = this.bookPath(ref.book);
         const session = await this.session(path);
         // Only request resources in this book's server-provided reading order.
-        const entry = session.toc.find(item => item.url === ref.source);
+        const entry = session.toc.find(item => item.url === ref.source)
+            || session.toc.find(item => new URL(item.url).pathname === new URL(ref.source).pathname);
         if (!entry)
             throw new Error('The book layout changed; refresh its chapter list.');
         const $ = (0, cheerio_1.load)(await this.xml(session, entry.url), { xmlMode: true });
@@ -445,7 +450,7 @@ class ZLibGdPlugin {
     }
     async searchNovels(searchTerm, pageNo) {
         // Pasting a book URL gives a deterministic fallback while listing support is tested.
-        if (/^https:\/\/z-lib\.gd\/book\//i.test(searchTerm.trim())) {
+        if (/^https:\/\/z-lib\.(?:gd|do)\/book\//i.test(searchTerm.trim())) {
             if (pageNo > 1)
                 return [];
             const path = this.bookPath(searchTerm.trim());
