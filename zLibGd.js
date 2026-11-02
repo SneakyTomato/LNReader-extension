@@ -7,7 +7,7 @@ class ZLibGdPlugin {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
         this.site = 'https://z-lib.gd';
-        this.version = '0.1.0';
+        this.version = '0.1.1';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.gd/' } };
         this.readerOrigin = 'https://reader.z-lib.gd';
@@ -271,33 +271,10 @@ class ZLibGdPlugin {
         });
         return $('body').html() || $.root().html() || '';
     }
-    listing(html) {
-        const $ = (0, cheerio_1.load)(html), seen = new Set();
-        const novels = [];
-        $('a[href*="/book/"]').each((_, el) => {
-            const a = $(el);
-            let path;
-            try {
-                path = this.bookPath(a.attr('href'));
-            }
-            catch {
-                return;
-            }
-            if (seen.has(path))
-                return;
-            const name = (a.attr('title') || a.text() || a.find('img').attr('alt') || '').trim();
-            if (!name || name === 'Read Online')
-                return;
-            seen.add(path);
-            const image = a.find('img').attr('src');
-            novels.push({ name, path, ...(image ? { cover: new URL(image, this.site).href } : {}) });
-        });
-        if (!novels.length)
-            throw new Error('No book cards found. This experimental listing parser needs a live-site check.');
-        return novels;
-    }
-    async popularNovels(pageNo, _options) {
-        return this.listing(await this.text(`${this.site}/?page=${pageNo}`));
+    async popularNovels(_pageNo, _options) {
+        // This build imports by book URL. LNReader invokes this method on opening
+        // the source; an empty browse list must not depend on unverified homepage HTML.
+        return [];
     }
     async searchNovels(searchTerm, pageNo) {
         // Pasting a book URL gives a deterministic fallback while listing support is tested.
