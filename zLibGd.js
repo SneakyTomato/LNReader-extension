@@ -5,17 +5,43 @@ const cheerio_1 = require("cheerio");
 class ZLibGdPlugin {
     constructor() {
         this.id = 'zLibGd';
-        this.name = 'Z-Library GD (experimental)';
-        this.site = 'https://z-lib.do';
-        this.version = '0.2.4';
+        this.name = 'Z-Library (experimental)';
+        this.site = 'https://z-lib.fm';
+        this.version = '0.2.6';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.do/' } };
         this.readerOrigin = 'https://reader.z-lib.do';
-        this.bookOrigins = ['https://z-lib.gd', 'https://z-lib.do'];
+        this.bookOrigins = ['https://z-lib.fm', 'https://z-lib.gd', 'https://z-lib.do'];
         this.readerOrigins = ['https://reader.z-lib.gd', 'https://reader.z-lib.do'];
         this.sessions = new Map();
         this.challengeCookies = new Map();
+        this.serverCookies = new Map();
         this.englishChecks = new Map();
+    }
+    rememberCookies(origin, response) {
+        if (response.url && new URL(response.url).origin !== origin)
+            return;
+        const headers = response.headers;
+        const lines = typeof headers?.getSetCookie === 'function'
+            ? headers.getSetCookie()
+            : [headers?.get?.('set-cookie') || ''];
+        let jar = this.serverCookies.get(origin);
+        if (!jar) {
+            jar = new Map();
+            this.serverCookies.set(origin, jar);
+        }
+        for (const line of lines) {
+            // Commas inside Expires dates do not start a new cookie name/value pair.
+            for (const cookie of line.split(/,(?=\s*[^;,\s=]+\s*=)/)) {
+                const match = cookie.match(/^\s*([^=;,\s]+)=([^;]*)/);
+                if (!match)
+                    continue;
+                if (/;\s*max-age\s*=\s*0(?:;|$)/i.test(cookie))
+                    jar.delete(match[1]);
+                else
+                    jar.set(match[1], match[2]);
+            }
+        }
     }
     isEnglish(language) {
         return /^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language.trim());
@@ -165,7 +191,7 @@ class ZLibGdPlugin {
     bookPath(input) {
         const url = new URL(this.absoluteUrl(input, this.site));
         if (!this.bookOrigins.includes(url.origin) || !/^\/book\/[^/]+\/.+\.html$/.test(url.pathname)) {
-            throw new Error('Use a z-lib.do or z-lib.gd book details URL.');
+            throw new Error('Use a z-lib.fm, z-lib.do or z-lib.gd book details URL.');
         }
         return url.pathname;
     }
@@ -179,9 +205,21 @@ class ZLibGdPlugin {
     async text(url, init) {
         const origin = new URL(url).origin;
         const eligible = this.bookOrigins.includes(origin) || this.readerOrigins.includes(origin);
-        const request = () => {
-            const cookie = eligible ? this.challengeCookies.get(origin) : undefined;
-            return (0, fetch_1.fetchApi)(url, cookie ? { ...init, headers: { ...init?.headers, Cookie: cookie } } : init);
+        const request = async () => {
+            const cookies = [];
+            if (eligible) {
+                const proof = this.challengeCookies.get(origin);
+                if (proof)
+                    cookies.push(proof);
+                for (const [name, value] of this.serverCookies.get(origin) || [])
+                    cookies.push(`${name}=${value}`);
+            }
+            const options = { ...init, credentials: eligible ? 'include' : 'omit',
+                ...(cookies.length ? { headers: { ...init?.headers, Cookie: cookies.join('; ') } } : {}) };
+            const response = await (0, fetch_1.fetchApi)(url, options);
+            if (eligible)
+                this.rememberCookies(origin, response);
+            return response;
         };
         let response = await request();
         // Challenge HTML can accompany HTTP 503; inspect the body before rejecting.
@@ -496,7 +534,7 @@ class ZLibGdPlugin {
     }
     async searchNovels(searchTerm, pageNo) {
         // Pasting a book URL gives a deterministic fallback while listing support is tested.
-        if (/^https:\/\/z-lib\.(?:gd|do)\/book\//i.test(searchTerm.trim())) {
+        if (/^https:\/\/z-lib\.(?:fm|gd|do)\/book\//i.test(searchTerm.trim())) {
             if (pageNo > 1)
                 return [];
             const path = this.bookPath(searchTerm.trim());
