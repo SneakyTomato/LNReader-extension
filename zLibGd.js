@@ -7,12 +7,50 @@ class ZLibGdPlugin {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
         this.site = 'https://z-lib.gd';
-        this.version = '0.2.1';
+        this.version = '0.2.2';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.gd/' } };
         this.readerOrigin = 'https://reader.z-lib.gd';
         this.sessions = new Map();
         this.challengeCookies = new Map();
+    }
+    absoluteUrl(reference, base) {
+        // Resolve file-relative paths ourselves. Some mobile URL implementations
+        // append to a file base (content.opf/toc.ncx) instead of replacing its name.
+        const ref = reference.trim();
+        if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) {
+            if (!/^https?:/i.test(ref))
+                throw new Error('Unsupported resource URL scheme.');
+            return new URL(ref).href;
+        }
+        const parent = new URL(base);
+        if (ref.startsWith('//'))
+            return new URL(parent.protocol + ref).href;
+        const cleanBase = base.split('#')[0];
+        if (!ref)
+            return cleanBase;
+        if (ref.startsWith('#'))
+            return cleanBase + ref;
+        if (ref.startsWith('?'))
+            return cleanBase.split('?')[0] + ref;
+        const split = ref.search(/[?#]/);
+        const relativePath = split < 0 ? ref : ref.slice(0, split);
+        const suffix = split < 0 ? '' : ref.slice(split);
+        const directory = parent.pathname.slice(0, parent.pathname.lastIndexOf('/') + 1);
+        const combined = relativePath.startsWith('/') ? relativePath : directory + relativePath;
+        const segments = [];
+        for (const segment of combined.split('/')) {
+            if (segment === '..') {
+                if (segments.length > 1)
+                    segments.pop();
+            }
+            else if (segment !== '.')
+                segments.push(segment);
+        }
+        let path = segments.join('/') || '/';
+        if (/\/\.{1,2}$/.test(combined) && !path.endsWith('/'))
+            path += '/';
+        return new URL(parent.origin + path + suffix).href;
     }
     sha1Ascii(input) {
         const size = Math.ceil((input.length + 9) / 64) * 16;
@@ -81,7 +119,7 @@ class ZLibGdPlugin {
         throw new Error('The website browser check exceeded this plugin\'s computation limit.');
     }
     bookPath(input) {
-        const url = new URL(input, this.site);
+        const url = new URL(this.absoluteUrl(input, this.site));
         if (url.origin !== this.site || !/^\/book\/[^/]+\/.+\.html$/.test(url.pathname)) {
             throw new Error('Use a z-lib.gd book details URL.');
         }
@@ -90,9 +128,9 @@ class ZLibGdPlugin {
     resolveUrl(path) {
         if (path.startsWith('zlib-chapter:')) {
             const ref = JSON.parse(decodeURIComponent(path.slice(13)));
-            return new URL(this.bookPath(ref.book), this.site).href;
+            return this.absoluteUrl(this.bookPath(ref.book), this.site);
         }
-        return new URL(this.bookPath(path), this.site).href;
+        return this.absoluteUrl(this.bookPath(path), this.site);
     }
     async text(url, init) {
         const origin = new URL(url).origin;
@@ -119,7 +157,7 @@ class ZLibGdPlugin {
         return body;
     }
     async api(path, session, body) {
-        const url = new URL(path, this.readerOrigin);
+        const url = new URL(this.absoluteUrl(path, this.readerOrigin));
         if (session.accessToken)
             url.searchParams.set('access_token', session.accessToken);
         const headers = {
@@ -162,7 +200,7 @@ class ZLibGdPlugin {
             signedUrl = result[source];
         if (!signedUrl)
             throw new Error('This resource is unavailable for the current reader session.');
-        const target = new URL(signedUrl, this.readerOrigin);
+        const target = new URL(this.absoluteUrl(signedUrl, this.readerOrigin));
         if (target.protocol !== 'https:')
             throw new Error('Unexpected resource URL.');
         return target.href;
@@ -176,7 +214,7 @@ class ZLibGdPlugin {
         const link = page('a.reader-link').first().attr('href');
         if (!link)
             throw new Error('This book does not expose a Read Online link.');
-        const readerUrl = new URL(link, this.site);
+        const readerUrl = new URL(this.absoluteUrl(link, this.site));
         if (readerUrl.origin !== this.readerOrigin)
             throw new Error('Reader domain changed; this plugin needs an update.');
         const html = await this.text(readerUrl.href);
@@ -203,6 +241,179 @@ class ZLibGdPlugin {
         }
         const prepared = await this.api('/api/prepare-book?' + params.toString(), session);
         if (prepared.block_status)
+            throw new Error('The server restricted access to this book.');
+        if (prepared.extension !== 'epub' || prepared.type !== 'FLOW') {
+            throw new Error('This experimental source currently supports EPUB books only.');
+        }
+        session.fileId = prepared.fileIdentifier;
+        const query = new URLSearchParams({ file_identifier: session.fileId, book_id: String(prepared.bookId) });
+        if (prepared.source)
+            query.set('source', prepared.source);
+        const configured = await this.api('/api/fetch-config?' + query.toString(), session);
+        session.bookToken = configured.result?.book_info_token;
+        session.opfUrl = configured.result?.configURL;
+        if (!session.opfUrl || !session.bookToken)
+            throw new Error('Reader configuration is incomplete.');
+        // This server currently supplies an OPF URL. Do not guess a different layout.
+        if (!/\.opf(?:\?|$)/i.test(session.opfUrl))
+            throw new Error('Unsupported reader package layout.');
+        const opf = (0, cheerio_1.load)(await this.xml(session, session.opfUrl), { xmlMode: true });
+        const items = new Map();
+        opf('item').each((_, item) => {
+            const el = opf(item), id = el.attr('id'), href = el.attr('href');
+            if (id && href)
+                items.set(id, {
+                    href: this.absoluteUrl(href, session.opfUrl),
+                    properties: el.attr('properties') || '', media: el.attr('media-type'),
+                });
+        });
+        const nav = [...items.values()].find(item => item.properties.split(/\s+/).includes('nav'));
+        const ncx = [...items.values()].find(item => item.media === 'application/x-dtbncx+xml');
+        const labels = new Map();
+        if (nav || ncx) {
+            const entry = (nav || ncx);
+            const navigation = (0, cheerio_1.load)(await this.xml(session, entry.href), { xmlMode: true });
+            if (nav) {
+                const root = navigation('nav').filter((_, el) => navigation(el).attr('epub:type') === 'toc' || navigation(el).attr('role') === 'doc-toc').first();
+                (root.length ? root : navigation('nav').first()).find('a[href]').each((_, el) => {
+                    const url = this.absoluteUrl(navigation(el).attr('href'), entry.href).split('#')[0];
+                    if (!labels.has(url))
+                        labels.set(url, navigation(el).text().trim());
+                });
+            }
+            else {
+                navigation('navPoint').each((_, el) => {
+                    const point = navigation(el), href = point.children('content').attr('src');
+                    if (!href)
+                        return;
+                    const url = this.absoluteUrl(href, entry.href).split('#')[0];
+                    if (!labels.has(url))
+                        labels.set(url, point.children('navLabel').text().trim());
+                });
+            }
+        }
+        opf('spine > itemref').each((index, el) => {
+            if (opf(el).attr('linear') === 'no')
+                return;
+            const item = items.get(opf(el).attr('idref') || '');
+            if (!item)
+                return;
+            const url = item.href.split('#')[0];
+            session.toc.push({ name: labels.get(url) || `Section ${index + 1}`, url });
+        });
+        if (!session.toc.length)
+            throw new Error('No readable spine entries were found.');
+        return session;
+    }
+    async session(path, details) {
+        let promise = this.sessions.get(path);
+        if (promise) {
+            const cached = await promise;
+            if (cached.expiresAt > Date.now())
+                return cached;
+            this.sessions.delete(path);
+        }
+        if (this.sessions.size >= 3)
+            this.sessions.delete(this.sessions.keys().next().value);
+        promise = this.createSession(path, details);
+        this.sessions.set(path, promise);
+        try {
+            return await promise;
+        }
+        catch (error) {
+            this.sessions.delete(path);
+            throw error;
+        }
+    }
+    async parseNovel(novelPath) {
+        const path = this.bookPath(novelPath);
+        const html = await this.text(this.site + path);
+        const $ = (0, cheerio_1.load)(html);
+        const name = $('h1.book-title').first().text().trim();
+        if (!name)
+            throw new Error('Book details were not found.');
+        const session = await this.session(path, html);
+        const cover = $('.details-book-cover-container z-cover img[src], .details-book-cover-container img[src]').first().attr('src');
+        return {
+            name, path, author: $('.authors').first().text().trim(),
+            summary: $('#bookDescriptionBox').text().trim(),
+            genres: $('.property_categories .property_value').text().trim(),
+            ...(cover ? { cover: this.absoluteUrl(cover, this.site) } : {}),
+            chapters: session.toc.map((entry, index) => ({
+                name: entry.name, chapterNumber: index + 1,
+                // Store stable book and resource identities, never expiring credentials.
+                path: 'zlib-chapter:' + encodeURIComponent(JSON.stringify({ book: path, source: entry.url })),
+            })),
+        };
+    }
+    async parseChapter(chapterPath) {
+        if (!chapterPath.startsWith('zlib-chapter:'))
+            throw new Error('Invalid chapter reference.');
+        const ref = JSON.parse(decodeURIComponent(chapterPath.slice(13)));
+        const path = this.bookPath(ref.book);
+        const session = await this.session(path);
+        // Only request resources in this book's server-provided reading order.
+        const entry = session.toc.find(item => item.url === ref.source);
+        if (!entry)
+            throw new Error('The book layout changed; refresh its chapter list.');
+        const $ = (0, cheerio_1.load)(await this.xml(session, entry.url), { xmlMode: true });
+        $('script, style, link, iframe, object, embed, form').remove();
+        $('*').each((_, el) => {
+            for (const name of Object.keys(el.attribs || {})) {
+                if (/^on/i.test(name))
+                    $(el).removeAttr(name);
+            }
+        });
+        for (const img of $('img, image').toArray()) {
+            const attr = $(img).is('img') ? 'src' : ($(img).attr('href') ? 'href' : 'xlink:href');
+            const src = $(img).attr(attr);
+            if (!src)
+                continue;
+            if (/^(?:data:|blob:)/i.test(src)) {
+                $(img).remove();
+                continue;
+            }
+            const source = this.absoluteUrl(src, entry.url);
+            $(img).attr(attr, await this.resource(session, source));
+        }
+        $('a[href]').each((_, el) => {
+            const href = $(el).attr('href') || '';
+            if (/^\s*(?:javascript|data):/i.test(href))
+                $(el).removeAttr('href');
+        });
+        return $('body').html() || $.root().html() || '';
+    }
+    catalog(html, mode) {
+        const $ = (0, cheerio_1.load)(html);
+        const books = [];
+        const seen = new Set();
+        const scope = mode === 'search' ? $('#searchResultBox') : $('z-masonry, .masonry-endless');
+        const add = (href, title, image) => {
+            if (!href)
+                return;
+            let path;
+            try {
+                path = this.bookPath(href);
+            }
+            catch {
+                return;
+            }
+            const name = title.replace(/\s+/g, ' ').trim();
+            if (!name || seen.has(path))
+                return;
+            seen.add(path);
+            let cover;
+            if (image && !/^(?:data:|blob:)/i.test(image)) {
+                const url = new URL(this.absoluteUrl(image, this.site));
+                if (url.protocol === 'https:')
+                    cover = url.href;
+            }
+            books.push({ name, path, ...(cover ? { cover } : {}) });
+        };
+        // Z-Library result cards store their URL on a custom element, not an <a>.
+        const cards = scope.length ? scope.find('z-bookcard[href]') : $('z-bookcard[href]');
+        cards.each((_, el) => {
+            const card = $(el), img = card.findblock_status)
             throw new Error('The server restricted access to this book.');
         if (prepared.extension !== 'epub' || prepared.type !== 'FLOW') {
             throw new Error('This experimental source currently supports EPUB books only.');
