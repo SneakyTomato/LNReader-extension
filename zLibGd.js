@@ -7,7 +7,7 @@ class ZLibGdPlugin {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
         this.site = 'https://z-lib.gd';
-        this.version = '0.1.1';
+        this.version = '0.2.0';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.gd/' } };
         this.readerOrigin = 'https://reader.z-lib.gd';
@@ -33,7 +33,7 @@ class ZLibGdPlugin {
             throw new Error(`Website returned HTTP ${response.status}. Open the source in LNReader's WebView and check access.`);
         }
         const body = await response.text();
-        if (/<title>\s*Checking your browser/i.test(body)) {
+        if (/<title[^>]*>\s*(?:Checking your browser|Just a moment|Access denied|Attention required)/i.test(body)) {
             throw new Error('Browser check required. Open this source in LNReader\'s WebView, complete the check, then retry. Tor routing alone does not complete it.');
         }
         return body;
@@ -271,10 +271,65 @@ class ZLibGdPlugin {
         });
         return $('body').html() || $.root().html() || '';
     }
-    async popularNovels(_pageNo, _options) {
-        // This build imports by book URL. LNReader invokes this method on opening
-        // the source; an empty browse list must not depend on unverified homepage HTML.
-        return [];
+    catalog(html, mode) {
+        const $ = (0, cheerio_1.load)(html);
+        const books = [];
+        const seen = new Set();
+        const scope = mode === 'search' ? $('#searchResultBox') : $('.masonry-endless');
+        const add = (href, title, image) => {
+            if (!href)
+                return;
+            let path;
+            try {
+                path = this.bookPath(href);
+            }
+            catch {
+                return;
+            }
+            const name = title.replace(/\s+/g, ' ').trim();
+            if (!name || seen.has(path))
+                return;
+            seen.add(path);
+            let cover;
+            if (image && !/^(?:data:|blob:)/i.test(image)) {
+                const url = new URL(image, this.site);
+                if (url.protocol === 'https:')
+                    cover = url.href;
+            }
+            books.push({ name, path, ...(cover ? { cover } : {}) });
+        };
+        // Z-Library result cards store their URL on a custom element, not an <a>.
+        const cards = scope.length ? scope.find('z-bookcard[href]') : $('z-bookcard[href]');
+        cards.each((_, el) => {
+            const card = $(el), img = card.find('img').first();
+            add(card.attr('href'), card.find('[slot="title"]').first().text()
+                || card.attr('title') || card.find('z-cover').attr('title') || '', img.attr('data-src') || img.attr('src') || card.attr('cover'));
+        });
+        scope.find('.item, .book-item').each((_, el) => {
+            const item = $(el), link = item.find('a[href*="/book/"]').first();
+            const cover = item.find('z-cover').first(), img = item.find('img').first();
+            add(link.attr('href'), cover.attr('title') || item.find('[slot="title"]').first().text()
+                || link.attr('title') || link.text(), img.attr('data-src') || img.attr('src') || cover.attr('src'));
+        });
+        // Older layouts use ordinary title links inside a recognized result area.
+        scope.find('a[href*="/book/"]').each((_, el) => {
+            const link = $(el), img = link.find('img').first();
+            add(link.attr('href'), link.find('z-cover').attr('title')
+                || link.attr('title') || link.text() || img.attr('alt') || '', img.attr('data-src') || img.attr('src'));
+        });
+        if (books.length)
+            return books;
+        const pageTitle = $('title').text().replace(/\s+/g, ' ').trim().slice(0, 100);
+        const explicitEmpty = /(?:nothing (?:has been|was) found|no (?:books|results) found|no results matching)/i.test(scope.text());
+        if (mode === 'search' && scope.length && explicitEmpty)
+            return [];
+        throw new Error(`${mode === 'search' ? 'Search' : 'Popular books'} page did not contain recognizable book cards${pageTitle ? ` (page title: ${pageTitle})` : ''}. WebView may have loaded a different page or session. Please share this error and a saved copy of the corresponding page.`);
+    }
+    async popularNovels(pageNo, _options) {
+        // Only the first catalog page has a verified route in the reference project.
+        if (pageNo > 1)
+            return [];
+        return this.catalog(await this.text(this.site + '/popular'), 'popular');
     }
     async searchNovels(searchTerm, pageNo) {
         // Pasting a book URL gives a deterministic fallback while listing support is tested.
@@ -288,7 +343,10 @@ class ZLibGdPlugin {
                 throw new Error('Book details were not found.');
             return [{ name, path }];
         }
-        throw new Error('For this experimental build, paste a full z-lib.gd book URL into Search. Keyword search has not been verified yet.');
+        const query = searchTerm.trim();
+        if (!query || pageNo > 1)
+            return [];
+        return this.catalog(await this.text(this.site + '/s/' + encodeURIComponent(query)), 'search');
     }
 }
 exports.default = new ZLibGdPlugin();
