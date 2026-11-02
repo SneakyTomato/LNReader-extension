@@ -5,84 +5,16 @@ const cheerio_1 = require("cheerio");
 class ZLibGdPlugin {
     constructor() {
         this.id = 'zLibGd';
-        this.name = 'Z-Library (experimental)';
-        this.site = 'https://z-lib.fm';
-        this.version = '0.2.6';
+        this.name = 'Z-Library GD (experimental)';
+        this.site = 'https://z-lib.do';
+        this.version = '0.2.7';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.do/' } };
         this.readerOrigin = 'https://reader.z-lib.do';
-        this.bookOrigins = ['https://z-lib.fm', 'https://z-lib.gd', 'https://z-lib.do'];
+        this.bookOrigins = ['https://z-lib.gd', 'https://z-lib.do'];
         this.readerOrigins = ['https://reader.z-lib.gd', 'https://reader.z-lib.do'];
         this.sessions = new Map();
         this.challengeCookies = new Map();
-        this.serverCookies = new Map();
-        this.englishChecks = new Map();
-    }
-    rememberCookies(origin, response) {
-        if (response.url && new URL(response.url).origin !== origin)
-            return;
-        const headers = response.headers;
-        const lines = typeof headers?.getSetCookie === 'function'
-            ? headers.getSetCookie()
-            : [headers?.get?.('set-cookie') || ''];
-        let jar = this.serverCookies.get(origin);
-        if (!jar) {
-            jar = new Map();
-            this.serverCookies.set(origin, jar);
-        }
-        for (const line of lines) {
-            // Commas inside Expires dates do not start a new cookie name/value pair.
-            for (const cookie of line.split(/,(?=\s*[^;,\s=]+\s*=)/)) {
-                const match = cookie.match(/^\s*([^=;,\s]+)=([^;]*)/);
-                if (!match)
-                    continue;
-                if (/;\s*max-age\s*=\s*0(?:;|$)/i.test(cookie))
-                    jar.delete(match[1]);
-                else
-                    jar.set(match[1], match[2]);
-            }
-        }
-    }
-    isEnglish(language) {
-        return /^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language.trim());
-    }
-    languageOf(html) {
-        const $ = (0, cheerio_1.load)(html);
-        const field = $('.property_language .property_value').first();
-        const alternate = $('[itemprop="inLanguage"]').first();
-        return (field.text() || alternate.attr('content') || alternate.text()).trim();
-    }
-    async englishBooks(books) {
-        const keep = new Array(books.length).fill(false);
-        let next = 0;
-        const worker = async () => {
-            while (next < books.length) {
-                const index = next++, book = books[index];
-                if (book.language) {
-                    keep[index] = this.isEnglish(book.language);
-                    continue;
-                }
-                let cached = this.englishChecks.get(book.path);
-                if (!cached || cached.expires < Date.now()) {
-                    if (this.englishChecks.size >= 200)
-                        this.englishChecks.delete(this.englishChecks.keys().next().value);
-                    cached = {
-                        expires: Date.now() + 10 * 60 * 1000,
-                        result: this.text(this.site + book.path).then(html => this.isEnglish(this.languageOf(html))),
-                    };
-                    this.englishChecks.set(book.path, cached);
-                }
-                try {
-                    keep[index] = await cached.result;
-                }
-                catch (error) {
-                    this.englishChecks.delete(book.path);
-                    throw error;
-                }
-            }
-        };
-        await Promise.all(Array.from({ length: Math.min(3, books.length) }, worker));
-        return books.filter((_, index) => keep[index]).map(({ language, ...book }) => book);
     }
     absoluteUrl(reference, base) {
         // Resolve file-relative paths ourselves. Some mobile URL implementations
@@ -191,7 +123,7 @@ class ZLibGdPlugin {
     bookPath(input) {
         const url = new URL(this.absoluteUrl(input, this.site));
         if (!this.bookOrigins.includes(url.origin) || !/^\/book\/[^/]+\/.+\.html$/.test(url.pathname)) {
-            throw new Error('Use a z-lib.fm, z-lib.do or z-lib.gd book details URL.');
+            throw new Error('Use a z-lib.do or z-lib.gd book details URL.');
         }
         return url.pathname;
     }
@@ -205,21 +137,9 @@ class ZLibGdPlugin {
     async text(url, init) {
         const origin = new URL(url).origin;
         const eligible = this.bookOrigins.includes(origin) || this.readerOrigins.includes(origin);
-        const request = async () => {
-            const cookies = [];
-            if (eligible) {
-                const proof = this.challengeCookies.get(origin);
-                if (proof)
-                    cookies.push(proof);
-                for (const [name, value] of this.serverCookies.get(origin) || [])
-                    cookies.push(`${name}=${value}`);
-            }
-            const options = { ...init, credentials: eligible ? 'include' : 'omit',
-                ...(cookies.length ? { headers: { ...init?.headers, Cookie: cookies.join('; ') } } : {}) };
-            const response = await (0, fetch_1.fetchApi)(url, options);
-            if (eligible)
-                this.rememberCookies(origin, response);
-            return response;
+        const request = () => {
+            const cookie = eligible ? this.challengeCookies.get(origin) : undefined;
+            return (0, fetch_1.fetchApi)(url, cookie ? { ...init, headers: { ...init?.headers, Cookie: cookie } } : init);
         };
         let response = await request();
         // Challenge HTML can accompany HTTP 503; inspect the body before rejecting.
@@ -234,6 +154,10 @@ class ZLibGdPlugin {
             }
         }
         if (!response.ok) {
+            if (response.status === 429) {
+                const wait = response.headers?.get?.('retry-after');
+                throw new Error(`The website is rate limiting requests (HTTP 429). Wait before retrying.${wait ? ` Server Retry-After: ${wait}.` : ''}`);
+            }
             throw new Error(`Website returned HTTP ${response.status} for ${new URL(url).pathname}. This request did not receive a supported browser check.`);
         }
         return body;
@@ -329,8 +253,6 @@ class ZLibGdPlugin {
         if (prepared.extension !== 'epub' || prepared.type !== 'FLOW') {
             throw new Error('This experimental source currently supports EPUB books only.');
         }
-        if (prepared.language && !this.isEnglish(prepared.language))
-            throw new Error('This reader edition is not in English.');
         session.fileId = prepared.fileIdentifier;
         const query = new URLSearchParams({ file_identifier: session.fileId, book_id: String(prepared.bookId) });
         if (prepared.source)
@@ -418,8 +340,6 @@ class ZLibGdPlugin {
         const name = $('h1.book-title').first().text().trim();
         if (!name)
             throw new Error('Book details were not found.');
-        if (!this.isEnglish(this.languageOf(html)))
-            throw new Error('This source only loads books confirmed as English by the website.');
         const session = await this.session(path, html);
         const cover = $('.details-book-cover-container z-cover img[src], .details-book-cover-container img[src]').first().attr('src');
         return {
@@ -476,8 +396,9 @@ class ZLibGdPlugin {
         const $ = (0, cheerio_1.load)(html);
         const books = [];
         const seen = new Set();
+        const excluded = new Set();
         const scope = mode === 'search' ? $('#searchResultBox') : $('z-masonry, .masonry-endless');
-        const add = (href, title, image, language) => {
+        const add = (href, title, image) => {
             if (!href)
                 return;
             let path;
@@ -487,6 +408,8 @@ class ZLibGdPlugin {
             catch {
                 return;
             }
+            if (excluded.has(path))
+                return;
             const name = title.replace(/\s+/g, ' ').trim();
             if (!name || seen.has(path))
                 return;
@@ -497,14 +420,22 @@ class ZLibGdPlugin {
                 if (url.protocol === 'https:')
                     cover = url.href;
             }
-            books.push({ name, path, ...(cover ? { cover } : {}), ...(language ? { language } : {}) });
+            books.push({ name, path, ...(cover ? { cover } : {}) });
         };
         // Z-Library result cards store their URL on a custom element, not an <a>.
         const cards = scope.length ? scope.find('z-bookcard[href]') : $('z-bookcard[href]');
         cards.each((_, el) => {
             const card = $(el), img = card.find('img').first();
+            const language = (card.attr('language') || '').trim();
+            if (mode === 'search' && language && !/^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language)) {
+                try {
+                    excluded.add(this.bookPath(card.attr('href')));
+                }
+                catch { }
+                return;
+            }
             add(card.attr('href'), card.find('[slot="title"]').first().text()
-                || card.attr('title') || card.find('z-cover').attr('title') || '', img.attr('data-src') || img.attr('src') || card.attr('cover'), card.attr('language'));
+                || card.attr('title') || card.find('z-cover').attr('title') || '', img.attr('data-src') || img.attr('src') || card.attr('cover'));
         });
         scope.find('.item, .book-item').each((_, el) => {
             const item = $(el), link = item.find('a[href*="/book/"]').first();
@@ -518,7 +449,7 @@ class ZLibGdPlugin {
             add(link.attr('href'), link.find('z-cover').attr('title')
                 || link.attr('title') || link.text() || img.attr('alt') || '', img.attr('data-src') || img.attr('src'));
         });
-        if (books.length)
+        if (books.length || (mode === 'search' && cards.length))
             return books;
         const pageTitle = $('title').text().replace(/\s+/g, ' ').trim().slice(0, 100);
         const explicitEmpty = /(?:nothing (?:has been|was) found|no (?:books|results) found|no results matching)/i.test(scope.text());
@@ -530,27 +461,27 @@ class ZLibGdPlugin {
         // Only the first catalog page has a verified route in the reference project.
         if (pageNo > 1)
             return [];
-        return this.englishBooks(this.catalog(await this.text(this.site + '/popular?languages%5B%5D=english'), 'popular'));
+        return this.catalog(await this.text(this.site + '/popular'), 'popular');
     }
     async searchNovels(searchTerm, pageNo) {
         // Pasting a book URL gives a deterministic fallback while listing support is tested.
-        if (/^https:\/\/z-lib\.(?:fm|gd|do)\/book\//i.test(searchTerm.trim())) {
+        if (/^https:\/\/z-lib\.(?:gd|do)\/book\//i.test(searchTerm.trim())) {
             if (pageNo > 1)
                 return [];
             const path = this.bookPath(searchTerm.trim());
-            const html = await this.text(this.site + path);
-            const $ = (0, cheerio_1.load)(html);
+            const $ = (0, cheerio_1.load)(await this.text(this.site + path));
             const name = $('h1.book-title').first().text().trim();
             if (!name)
                 throw new Error('Book details were not found.');
-            if (!this.isEnglish(this.languageOf(html)))
+            const language = $('.property_language .property_value').first().text().trim();
+            if (!/^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language))
                 return [];
             return [{ name, path }];
         }
         const query = searchTerm.trim();
         if (!query || pageNo > 1)
             return [];
-        return this.englishBooks(this.catalog(await this.text(this.site + '/s/' + encodeURIComponent(query) + '?languages%5B%5D=english'), 'search'));
+        return this.catalog(await this.text(this.site + '/s/' + encodeURIComponent(query) + '?languages%5B%5D=english'), 'search');
     }
 }
 exports.default = new ZLibGdPlugin();
