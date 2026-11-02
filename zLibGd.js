@@ -7,11 +7,78 @@ class ZLibGdPlugin {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
         this.site = 'https://z-lib.gd';
-        this.version = '0.2.0';
+        this.version = '0.2.1';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.gd/' } };
         this.readerOrigin = 'https://reader.z-lib.gd';
         this.sessions = new Map();
+        this.challengeCookies = new Map();
+    }
+    sha1Ascii(input) {
+        const size = Math.ceil((input.length + 9) / 64) * 16;
+        const blocks = new Uint32Array(size), words = new Uint32Array(80);
+        for (let i = 0; i < input.length; i++)
+            blocks[i >>> 2] |= input.charCodeAt(i) << (24 - (i % 4) * 8);
+        blocks[input.length >>> 2] |= 0x80 << (24 - (input.length % 4) * 8);
+        blocks[size - 1] = input.length * 8;
+        let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+        const rotate = (value, bits) => (value << bits) | (value >>> (32 - bits));
+        for (let block = 0; block < size; block += 16) {
+            for (let i = 0; i < 16; i++)
+                words[i] = blocks[block + i];
+            for (let i = 16; i < 80; i++)
+                words[i] = rotate(words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
+            let a = h0, b = h1, c = h2, d = h3, e = h4;
+            for (let i = 0; i < 80; i++) {
+                const f = i < 20 ? (b & c) | (~b & d) : i < 40 ? b ^ c ^ d : i < 60 ? (b & c) | (b & d) | (c & d) : b ^ c ^ d;
+                const k = i < 20 ? 0x5a827999 : i < 40 ? 0x6ed9eba1 : i < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+                const next = (rotate(a, 5) + f + e + k + words[i]) | 0;
+                e = d;
+                d = c;
+                c = rotate(b, 30);
+                b = a;
+                a = next;
+            }
+            h0 = (h0 + a) | 0;
+            h1 = (h1 + b) | 0;
+            h2 = (h2 + c) | 0;
+            h3 = (h3 + d) | 0;
+            h4 = (h4 + e) | 0;
+        }
+        const bytes = [];
+        for (const word of [h0, h1, h2, h3, h4])
+            for (const shift of [24, 16, 8, 0])
+                bytes.push((word >>> shift) & 255);
+        return bytes;
+    }
+    isBrowserCheck(body) {
+        return /<title[^>]*>\s*(?:Checking your browser|Just a moment|Access denied|Attention required)/i.test(body);
+    }
+    async completeBrowserCheck(body) {
+        // Recognize only the observed site's fixed proof-of-work format. Never eval
+        // response JavaScript, guess access credentials, or modify reader access tokens.
+        const seedMatch = body.match(/\['([0-9a-f]{32,128})','c_token=','array'\]/i);
+        const target = body.match(/s\[n1\]===0x([0-9a-f]+).*?s\[n1\+0x1\]===0x([0-9a-f]+)/i);
+        if (!seedMatch || !target || !body.includes('c_time=')) {
+            throw new Error('The website returned an unsupported browser check. Its challenge format needs inspection.');
+        }
+        const seed = seedMatch[1], offset = parseInt(seed[0], 16);
+        const first = parseInt(target[1], 16), second = parseInt(target[2], 16);
+        if (offset >= 19 || first > 255 || second > 255)
+            throw new Error('Invalid browser-check parameters.');
+        const started = Date.now();
+        for (let nonce = 0; nonce < 1000000; nonce++) {
+            const hash = this.sha1Ascii(seed + nonce);
+            if (hash[offset] === first && hash[offset + 1] === second) {
+                return `c_token=${seed}${nonce}; c_time=${(Date.now() - started) / 1000}`;
+            }
+            if (nonce > 0 && nonce % 4096 === 0) {
+                if (Date.now() - started > 15000)
+                    break;
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+        }
+        throw new Error('The website browser check exceeded this plugin\'s computation limit.');
     }
     bookPath(input) {
         const url = new URL(input, this.site);
@@ -28,13 +95,26 @@ class ZLibGdPlugin {
         return new URL(this.bookPath(path), this.site).href;
     }
     async text(url, init) {
-        const response = await (0, fetch_1.fetchApi)(url, init);
-        if (!response.ok) {
-            throw new Error(`Website returned HTTP ${response.status}. Open the source in LNReader's WebView and check access.`);
+        const origin = new URL(url).origin;
+        const eligible = origin === this.site || origin === this.readerOrigin;
+        const request = () => {
+            const cookie = eligible ? this.challengeCookies.get(origin) : undefined;
+            return (0, fetch_1.fetchApi)(url, cookie ? { ...init, headers: { ...init?.headers, Cookie: cookie } } : init);
+        };
+        let response = await request();
+        // Challenge HTML can accompany HTTP 503; inspect the body before rejecting.
+        let body = await response.text();
+        if (eligible && this.isBrowserCheck(body)) {
+            this.challengeCookies.set(origin, await this.completeBrowserCheck(body));
+            response = await request();
+            body = await response.text();
+            if (this.isBrowserCheck(body)) {
+                this.challengeCookies.delete(origin);
+                throw new Error('The browser check was not accepted by the plugin request. WebView uses a separate session; reopening it alone may not resolve this.');
+            }
         }
-        const body = await response.text();
-        if (/<title[^>]*>\s*(?:Checking your browser|Just a moment|Access denied|Attention required)/i.test(body)) {
-            throw new Error('Browser check required. Open this source in LNReader\'s WebView, complete the check, then retry. Tor routing alone does not complete it.');
+        if (!response.ok) {
+            throw new Error(`Website returned HTTP ${response.status} for ${new URL(url).pathname}. This request did not receive a supported browser check.`);
         }
         return body;
     }
@@ -53,16 +133,13 @@ class ZLibGdPlugin {
             headers['X-File-Access-Token'] = session.fileToken;
         if (session.bookToken)
             headers['X-Book-Info-Token'] = session.bookToken;
-        const response = await (0, fetch_1.fetchApi)(url.href, {
+        const responseBody = await this.text(url.href, {
             method: body ? 'POST' : 'GET',
             headers,
             ...(body ? { body: JSON.stringify(body) } : {}),
         });
-        if (!response.ok) {
-            throw new Error(`Reader access failed (HTTP ${response.status}). Open the book in WebView to check its availability or sign in, then retry. No access limits are bypassed.`);
-        }
         try {
-            return await response.json();
+            return JSON.parse(responseBody);
         }
         catch {
             throw new Error('Reader returned a browser check or an unexpected response instead of JSON.');
@@ -275,7 +352,7 @@ class ZLibGdPlugin {
         const $ = (0, cheerio_1.load)(html);
         const books = [];
         const seen = new Set();
-        const scope = mode === 'search' ? $('#searchResultBox') : $('.masonry-endless');
+        const scope = mode === 'search' ? $('#searchResultBox') : $('z-masonry, .masonry-endless');
         const add = (href, title, image) => {
             if (!href)
                 return;
