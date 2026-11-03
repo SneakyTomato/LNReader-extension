@@ -2,12 +2,172 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const fetch_1 = require("@libs/fetch");
 const cheerio_1 = require("cheerio");
+const filterInputs_1 = require("@libs/filterInputs");
+// Main category links captured from the live site categories directory.
+const categories = [
+    {
+        "label": "Arts",
+        "value": "/category/1"
+    },
+    {
+        "label": "Astronomy",
+        "value": "/category/2"
+    },
+    {
+        "label": "Biography & Autobiography",
+        "value": "/category/3"
+    },
+    {
+        "label": "Biology and other natural sciences",
+        "value": "/category/4"
+    },
+    {
+        "label": "Business & Economics",
+        "value": "/category/5"
+    },
+    {
+        "label": "Chemistry",
+        "value": "/category/6"
+    },
+    {
+        "label": "Children's Books",
+        "value": "/category/7"
+    },
+    {
+        "label": "Comics & Graphic Novels",
+        "value": "/category/8"
+    },
+    {
+        "label": "Computers",
+        "value": "/category/10"
+    },
+    {
+        "label": "Cookbooks, Food & Wine",
+        "value": "/category/311"
+    },
+    {
+        "label": "Crime, Thrillers & Mystery",
+        "value": "/category/11"
+    },
+    {
+        "label": "Earth Sciences",
+        "value": "/category/722"
+    },
+    {
+        "label": "Education Studies & Teaching",
+        "value": "/category/12"
+    },
+    {
+        "label": "Engineering",
+        "value": "/category/13"
+    },
+    {
+        "label": "Erotica",
+        "value": "/category/712"
+    },
+    {
+        "label": "Fantasy",
+        "value": "/category/794"
+    },
+    {
+        "label": "Fiction",
+        "value": "/category/14"
+    },
+    {
+        "label": "History",
+        "value": "/category/17"
+    },
+    {
+        "label": "Housekeeping & Leisure",
+        "value": "/category/18"
+    },
+    {
+        "label": "Jurisprudence & Law",
+        "value": "/category/20"
+    },
+    {
+        "label": "Languages",
+        "value": "/category/21"
+    },
+    {
+        "label": "Linguistics",
+        "value": "/category/22"
+    },
+    {
+        "label": "Mathematics",
+        "value": "/category/23"
+    },
+    {
+        "label": "Medicine",
+        "value": "/category/24"
+    },
+    {
+        "label": "Nature, Animals & Pets",
+        "value": "/category/25"
+    },
+    {
+        "label": "Others",
+        "value": "/category/26"
+    },
+    {
+        "label": "Physics",
+        "value": "/category/27"
+    },
+    {
+        "label": "Poetry",
+        "value": "/category/28"
+    },
+    {
+        "label": "Psychology",
+        "value": "/category/29"
+    },
+    {
+        "label": "Reference",
+        "value": "/category/30"
+    },
+    {
+        "label": "Religion & Spirituality",
+        "value": "/category/31"
+    },
+    {
+        "label": "Romance",
+        "value": "/category/32"
+    },
+    {
+        "label": "Science (General)",
+        "value": "/category/33"
+    },
+    {
+        "label": "Science Fiction",
+        "value": "/category/34"
+    },
+    {
+        "label": "Self-Help, Relationships & Lifestyle",
+        "value": "/category/35"
+    },
+    {
+        "label": "Society, Politics & Philosophy",
+        "value": "/category/36"
+    },
+    {
+        "label": "Sports, Hobbies & Games",
+        "value": "/category/37"
+    },
+    {
+        "label": "Technique",
+        "value": "/category/38"
+    },
+    {
+        "label": "Travel",
+        "value": "/category/39"
+    }
+];
 class ZLibGdPlugin {
     constructor() {
         this.id = 'zLibGd';
         this.name = 'Z-Library GD (experimental)';
         this.site = 'https://z-lib.do';
-        this.version = '0.2.7';
+        this.version = '0.2.8';
         this.icon = 'src/en/zLibGd/icon.png';
         this.imageRequestInit = { headers: { Referer: 'https://reader.z-lib.do/' } };
         this.readerOrigin = 'https://reader.z-lib.do';
@@ -15,6 +175,73 @@ class ZLibGdPlugin {
         this.readerOrigins = ['https://reader.z-lib.gd', 'https://reader.z-lib.do'];
         this.sessions = new Map();
         this.challengeCookies = new Map();
+        this.filters = {
+            category: { type: filterInputs_1.FilterTypes.Picker, label: 'Category', value: '', options: [{ label: 'All categories', value: '' }, ...categories] },
+            query: { type: filterInputs_1.FilterTypes.TextInput, label: 'Keywords (optional when category selected)', value: '' },
+            language: {
+                type: filterInputs_1.FilterTypes.Picker, label: 'Search language', value: 'english',
+                options: [{ label: 'English', value: 'english' }, { label: 'All languages', value: '' }],
+            },
+            format: {
+                type: filterInputs_1.FilterTypes.Picker, label: 'Search file format', value: '',
+                options: [{ label: 'All formats', value: '' }, { label: 'EPUB (supported reader format)', value: 'EPUB' }],
+            },
+            yearFrom: { type: filterInputs_1.FilterTypes.TextInput, label: 'Publication year from (optional)', value: '' },
+            yearTo: { type: filterInputs_1.FilterTypes.TextInput, label: 'Publication year to (optional)', value: '' },
+            order: {
+                type: filterInputs_1.FilterTypes.Picker, label: 'Search sort order', value: '',
+                options: [
+                    { label: 'Website default', value: '' },
+                    { label: 'Best match', value: 'bestmatch' },
+                    { label: 'Most popular', value: 'popular' },
+                    { label: 'Recently added', value: 'date' },
+                    { label: 'Title (A–Z)', value: 'titleA' },
+                    { label: 'Title (Z–A)', value: 'title' },
+                    { label: 'Publication year', value: 'year' },
+                ],
+            },
+        };
+    }
+    filterValue(filters, key) {
+        // LNReader/Nekori send {value,type}; tolerate a plain value map as well.
+        const supplied = filters?.[key];
+        const value = supplied && typeof supplied === 'object' ? supplied.value : supplied;
+        return typeof value === 'string' ? value.trim() : this.filters[key].value;
+    }
+    searchUrl(query, filters) {
+        const category = this.filterValue(filters, 'category');
+        if (category && !categories.some(option => option.value === category))
+            throw new Error('Reset the category filter; this category is no longer supported.');
+        const language = this.filterValue(filters, 'language');
+        const format = this.filterValue(filters, 'format');
+        const order = this.filterValue(filters, 'order');
+        const from = this.filterValue(filters, 'yearFrom');
+        const to = this.filterValue(filters, 'yearTo');
+        if (!['', 'english'].includes(language) || !['', 'EPUB'].includes(format)
+            || !this.filters.order.options.some(option => option.value === order))
+            throw new Error('Reset the source filters; a selected option is no longer supported.');
+        for (const year of [from, to]) {
+            if (year && (!/^\d{1,4}$/.test(year) || Number(year) < 1)) {
+                throw new Error('Publication years must be numbers between 1 and 9999.');
+            }
+        }
+        if (from && to && Number(from) > Number(to))
+            throw new Error('The starting publication year must not exceed the ending year.');
+        const params = [];
+        const add = (key, value) => { if (value)
+            params.push(encodeURIComponent(key) + '=' + encodeURIComponent(value)); };
+        add('languages[]', language);
+        add('extensions[]', format);
+        add('yearFrom', from);
+        add('yearTo', to);
+        add('order', order);
+        // Scoped search needs a category slug segment before /s/; the bare
+        // /category/<id>/s/ route is not the site's category-search action.
+        if (category && query)
+            params.unshift('q=' + encodeURIComponent(query));
+        const categorySlug = category ? categories.find(option => option.value === category).label.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') : '';
+        const route = category ? category + (query ? '/' + categorySlug + '/s/' : '') : '/s/' + encodeURIComponent(query);
+        return { url: this.site + route + (params.length ? '?' + params.join('&') : ''), englishOnly: language === 'english' };
     }
     absoluteUrl(reference, base) {
         // Resolve file-relative paths ourselves. Some mobile URL implementations
@@ -392,8 +619,11 @@ class ZLibGdPlugin {
         });
         return $('body').html() || $.root().html() || '';
     }
-    catalog(html, mode) {
+    catalog(html, mode, englishOnly = mode === 'search') {
         const $ = (0, cheerio_1.load)(html);
+        // Search responses include hidden decoy cards outside the selected filters.
+        // They are not visible website results and must not enter the app's catalog.
+        $('[hidden], [aria-hidden="true"]').remove();
         const books = [];
         const seen = new Set();
         const excluded = new Set();
@@ -427,7 +657,7 @@ class ZLibGdPlugin {
         cards.each((_, el) => {
             const card = $(el), img = card.find('img').first();
             const language = (card.attr('language') || '').trim();
-            if (mode === 'search' && language && !/^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language)) {
+            if (englishOnly && language && !/^(?:english|en(?:[-_][a-z]{2})?)$/i.test(language)) {
                 try {
                     excluded.add(this.bookPath(card.attr('href')));
                 }
@@ -457,10 +687,21 @@ class ZLibGdPlugin {
             return [];
         throw new Error(`${mode === 'search' ? 'Search' : 'Popular books'} page did not contain recognizable book cards${pageTitle ? ` (page title: ${pageTitle})` : ''}. WebView may have loaded a different page or session. Please share this error and a saved copy of the corresponding page.`);
     }
-    async popularNovels(pageNo, _options) {
+    async popularNovels(pageNo, options) {
         // Only the first catalog page has a verified route in the reference project.
         if (pageNo > 1)
             return [];
+        const selected = options?.filters;
+        const query = this.filterValue(selected, 'query');
+        const changed = Object.keys(this.filters).some(key => this.filterValue(selected, key) !== this.filters[key].value);
+        if (query || this.filterValue(selected, 'category')) {
+            if (/^https?:\/\//i.test(query))
+                throw new Error('Enter search keywords in the filter panel. To open a book URL, use the regular search button.');
+            const search = this.searchUrl(query, selected);
+            return this.catalog(await this.text(search.url), 'search', search.englishOnly);
+        }
+        if (changed)
+            throw new Error('Choose a category or enter keywords in the filter panel to apply filters, or reset filters to return to Popular.');
         return this.catalog(await this.text(this.site + '/popular'), 'popular');
     }
     async searchNovels(searchTerm, pageNo) {
@@ -481,7 +722,8 @@ class ZLibGdPlugin {
         const query = searchTerm.trim();
         if (!query || pageNo > 1)
             return [];
-        return this.catalog(await this.text(this.site + '/s/' + encodeURIComponent(query) + '?languages%5B%5D=english'), 'search');
+        const search = this.searchUrl(query);
+        return this.catalog(await this.text(search.url), 'search', search.englishOnly);
     }
 }
 exports.default = new ZLibGdPlugin();
