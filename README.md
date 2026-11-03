@@ -1,4 +1,4 @@
-# Z-Library source for LNReader — experimental 0.2.4
+# Z-Library source for LNReader — experimental 0.2.8
 
 This package contains a custom source prototype targeting LNReader 2.1.4's
 plugin interface. It is JavaScript loaded through a plugin repository, not an APK.
